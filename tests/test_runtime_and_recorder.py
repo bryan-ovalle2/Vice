@@ -2562,6 +2562,12 @@ _UNRECOGNIZED_WINDOW = {"process": "explorer", "class": "Explorer"}
 _GAME_WINDOW = {"process": "testgame", "class": "TestGame"}
 
 
+def _game_window(window_id):
+    """The game's window as one lookup reports it: the id that gets pinned
+    belongs to the same window whose process/class matched."""
+    return {**_GAME_WINDOW, "window_id": window_id}
+
+
 class WindowCaptureLoopTests(unittest.IsolatedAsyncioTestCase):
     """_window_capture_loop: pinning, releasing, and the debounce that keeps
     a window recreated by a fullscreen/resolution change from costing a
@@ -2581,18 +2587,22 @@ class WindowCaptureLoopTests(unittest.IsolatedAsyncioTestCase):
         daemon._window_capture_id = window_capture_id
         return daemon
 
-    async def _run_loop(self, daemon, recorder: _FakeRecorder, ticks: int, *, wins=(), ids=(), geoms=()) -> None:
+    async def _run_loop(self, daemon, recorder: _FakeRecorder, ticks: int, *, wins=(), geoms=(), focus_id=None) -> None:
         """Run daemon._window_capture_loop for exactly `ticks` processing
         iterations (the immediate first check, then `ticks - 1` sleeps),
         then cancel it. Queues that run out return None (no active window /
-        no focused id / lookup failed) rather than raising.
+        lookup failed) rather than raising. Each window in `wins` carries the
+        id it was matched on, the way the real lookup returns it.
+
+        `focus_id` is what a fresh focus lookup would answer, standing in for
+        the user tabbing away mid-tick; the loop must never consult it.
 
         create_recorder needs to stay patched for the whole run, not just
         daemon construction: a real pin/release restart calls it again (see
         _restart_recorder_for_config), and without this it would build and
         start a real backend against the live environment.
         """
-        win_q, id_q, geom_q = list(wins), list(ids), list(geoms)
+        win_q, geom_q = list(wins), list(geoms)
         sleeps = 0
 
         async def fake_sleep(_seconds: float) -> None:
@@ -2604,21 +2614,19 @@ class WindowCaptureLoopTests(unittest.IsolatedAsyncioTestCase):
         def fake_get_active_window():
             return win_q.pop(0) if win_q else None
 
-        def fake_get_focused_window_id():
-            return id_q.pop(0) if id_q else None
-
         def fake_get_window_geometry(_window_id):
             return geom_q.pop(0) if geom_q else None
 
         with mock.patch("vice.main.create_recorder", return_value=recorder), \
              mock.patch("vice.main.asyncio.sleep", fake_sleep), \
              mock.patch("vice.active_window.get_active_window", side_effect=fake_get_active_window), \
-             mock.patch("vice.active_window.get_focused_window_id", side_effect=fake_get_focused_window_id), \
+             mock.patch("vice.active_window.get_focused_window_id", return_value=focus_id) as focus_lookup, \
              mock.patch("vice.active_window.get_window_geometry", side_effect=fake_get_window_geometry):
             try:
                 await daemon._window_capture_loop()
             except asyncio.CancelledError:
                 pass
+        self.focus_lookup = focus_lookup
 
     async def test_unrecognized_window_does_not_move_an_unset_pin(self) -> None:
         recorder = _FakeRecorder()
@@ -2651,7 +2659,7 @@ class WindowCaptureLoopTests(unittest.IsolatedAsyncioTestCase):
         recorder = _FakeRecorder()
         daemon = self._daemon(recorder, window_capture_id=None)
 
-        await self._run_loop(daemon, recorder, ticks=1, wins=[_GAME_WINDOW], ids=["0xNEW"])
+        await self._run_loop(daemon, recorder, ticks=1, wins=[_game_window("0xNEW")])
 
         self.assertEqual(daemon._window_capture_id, "0xNEW")
         self.assertEqual(recorder.start_calls, 1)
@@ -2663,7 +2671,7 @@ class WindowCaptureLoopTests(unittest.IsolatedAsyncioTestCase):
 
         await self._run_loop(
             daemon, recorder,
-            ticks=1, wins=[_GAME_WINDOW], ids=["0xNEW"],
+            ticks=1, wins=[_game_window("0xNEW")],
         )
 
         self.assertEqual(daemon._window_capture_id, "0xOLD")
@@ -2676,8 +2684,7 @@ class WindowCaptureLoopTests(unittest.IsolatedAsyncioTestCase):
         await self._run_loop(
             daemon, recorder,
             ticks=2,
-            wins=[_GAME_WINDOW, _GAME_WINDOW],
-            ids=["0xNEW", "0xNEW"],
+            wins=[_game_window("0xNEW"), _game_window("0xNEW")],
         )
 
         self.assertEqual(daemon._window_capture_id, "0xNEW")
@@ -2691,12 +2698,46 @@ class WindowCaptureLoopTests(unittest.IsolatedAsyncioTestCase):
         await self._run_loop(
             daemon, recorder,
             ticks=2,
-            wins=[_GAME_WINDOW, _GAME_WINDOW],
-            ids=["0xNEW1", "0xNEW2"],
+            wins=[_game_window("0xNEW1"), _game_window("0xNEW2")],
         )
 
         self.assertEqual(daemon._window_capture_id, "0xOLD")
         self.assertEqual(recorder.start_calls, 0)
+
+    async def test_pins_the_matched_window_even_if_focus_moves_away(self) -> None:
+        # Tabbing from the game to Discord between the match and the pin used
+        # to attach the pin to Discord's window under the game's name; the id
+        # now travels with the match, so a stale focus answer can't be used.
+        recorder = _FakeRecorder()
+        daemon = self._daemon(recorder, window_capture_id=None)
+
+        await self._run_loop(
+            daemon, recorder,
+            ticks=1,
+            wins=[_game_window("0xGAME")],
+            focus_id="0xDISCORD",
+        )
+
+        self.assertEqual(daemon._window_capture_id, "0xGAME")
+        self.assertEqual(recorder.start_calls, 1)
+        self.focus_lookup.assert_not_called()
+
+    async def test_a_matched_window_with_no_id_is_not_pinned(self) -> None:
+        # Native-Wayland windows (and a failed id lookup) report no window id;
+        # GSR can only pin X11 ids, so capture stays on the full display.
+        recorder = _FakeRecorder()
+        daemon = self._daemon(recorder, window_capture_id=None)
+
+        await self._run_loop(
+            daemon, recorder,
+            ticks=2,
+            wins=[_game_window(None), _GAME_WINDOW],
+            focus_id="0xDISCORD",
+        )
+
+        self.assertIsNone(daemon._window_capture_id)
+        self.assertEqual(recorder.start_calls, 0)
+        self.assertEqual(recorder.stop_calls, 0)
 
     async def test_release_waits_for_a_second_failed_check(self) -> None:
         recorder = _FakeRecorder()

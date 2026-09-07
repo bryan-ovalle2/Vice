@@ -780,7 +780,7 @@ class ViceDaemon:
             self.recorder.window_override = None
 
     async def _window_capture_loop(self) -> None:
-        from .active_window import get_active_window, get_focused_window_id, get_window_geometry
+        from .active_window import get_active_window, get_window_geometry
 
         # Candidate window id for swapping an active pin, held for one tick
         # before it's acted on. None means no swap is pending.
@@ -805,11 +805,11 @@ class ViceDaemon:
                 game = self._match_game(win) if win else None
                 if game:
                     pending_release = False
-                    try:
-                        current = await asyncio.to_thread(get_focused_window_id)
-                    except Exception:
-                        log.debug("Focused window id lookup failed", exc_info=True)
-                        continue
+                    # The id comes from the same lookup that matched the game,
+                    # so the pin can only ever land on the window we matched.
+                    # Asking X11 for focus again here would pin whatever the
+                    # user tabbed to in between (Discord) under the game's name.
+                    current = win.get("window_id")
                     if not current or current == self._window_capture_id:
                         pending_switch = None
                         continue

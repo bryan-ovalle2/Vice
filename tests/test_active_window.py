@@ -24,6 +24,25 @@ class WindowIdX11Tests(unittest.TestCase):
             self.assertIsNone(active_window._active_window_id_x11())
 
 
+class ActiveWindowIdentityX11Tests(unittest.TestCase):
+    """The X11 adapter reports the id of the very window it read process and
+    class from, so a caller pinning capture to a match can't drift onto
+    whatever got focused a moment later."""
+
+    def test_result_carries_the_window_it_described(self) -> None:
+        outs = ["0x03a00003\n", "1234\n", 'WM_CLASS(STRING) = "testgame", "TestGame"\n']
+        with mock.patch("vice.active_window._run", side_effect=outs), \
+             mock.patch("vice.active_window._read_proc_comm", return_value="testgame"):
+            win = active_window._get_active_window_x11()
+
+        self.assertEqual(win, {
+            "process": "testgame",
+            "class": "TestGame",
+            "pid": 1234,
+            "window_id": "0x03a00003",
+        })
+
+
 class WindowGeometryByIdX11Tests(unittest.TestCase):
     def test_parses_width_and_height(self) -> None:
         out = "WIN=94\nX=10\nY=20\nWIDTH=1920\nHEIGHT=1080\nSCREEN=0\n"

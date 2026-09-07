@@ -20,7 +20,10 @@ from typing import Callable, Optional
 
 log = logging.getLogger(__name__)
 
-ActiveWindow = dict  # {"process": str, "class": str, "pid": int}
+ActiveWindow = dict  # {"process": str, "class": str, "pid": int, "window_id": str | None}
+# window_id is the same id space as get_focused_window_id(); only the X11
+# adapter fills it, and it names the very window that was matched, so a
+# caller can pin capture without asking X11 for focus a second time.
 
 
 def _read_proc_comm(pid: int) -> str:
@@ -158,7 +161,7 @@ def _get_active_window_x11() -> Optional[ActiveWindow]:
             cls = parts[-1] or parts[0]
     if not (cls or proc):
         return None
-    return {"process": proc, "class": cls, "pid": pid}
+    return {"process": proc, "class": cls, "pid": pid, "window_id": wid}
 
 
 def _active_window_id_x11() -> Optional[str]:
