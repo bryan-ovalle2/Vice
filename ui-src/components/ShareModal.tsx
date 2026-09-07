@@ -7,7 +7,6 @@ import {Modal} from './Modal';
 import {t} from '../lib/i18n';
 
 interface DiscordCopy {
-  url: string;
   path: string;
   filename: string;
   size: number;

@@ -28,6 +28,7 @@ import re
 import shutil
 import socket
 import subprocess
+import tempfile
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -39,13 +40,12 @@ from importlib.resources import files as _pkg_files
 from aiohttp import WSMsgType, web
 
 from . import __version__
-from .editor import (DISCORD_AUDIO_KBPS, DISCORD_MAX_MB,
-                     DISCORD_MIN_VIDEO_KBPS, DISCORD_SIZE_MARGIN,
-                     EditorProjectStore, ExportBusy, ExportManager, Source,
-                     build_export_cmd, default_export_name, project_extent,
+from .editor import (DISCORD_MAX_BYTES, DiscordTooLarge, EditorProjectStore,
+                     ExportBusy, ExportManager, Source, build_export_cmd,
+                     default_export_name, discord_bitrates, project_extent,
                      sanitize_export_name, text_file_contents,
                      validate_project)
-from .media import probe_media, probe_media_detailed
+from .media import communicate_with_timeout, probe_media, probe_media_detailed
 from .playlists import (IMAGE_PREFIX, PlaylistStore, build_tag_index,
                         image_slug)
 from .recorder import (IMAGE_EXTS, KEEP_ALL_STREAMS, _available_encoders,
@@ -259,7 +259,8 @@ def _proxy_path(path: Path) -> Path:
         key = f"{path.stem}_{st.st_size}_{st.st_mtime_ns}"
     except OSError:
         key = path.stem
-    return PROXY_DIR / f"{key}.mp4"
+    # Invalidate previews made before the eight-bit playback fix (#172).
+    return PROXY_DIR / f"{key}_v2.mp4"
 
 
 def _purge_slug_proxies(slug: str) -> None:
@@ -420,7 +421,7 @@ async def _first_video_packet(path: Path) -> Optional[tuple[float, str]]:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+        out, _ = await communicate_with_timeout(proc, timeout=60)
     except (asyncio.TimeoutError, OSError) as exc:
         log.debug("Packet probe of %s failed: %s", path.name, exc)
         return None
@@ -449,7 +450,7 @@ async def _decode_complaint(path: Path) -> Optional[str]:
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
-        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+        _, stderr = await communicate_with_timeout(proc, timeout=60)
     except (asyncio.TimeoutError, OSError) as exc:
         log.debug("Decode probe of %s failed: %s", path.name, exc)
         return None
@@ -488,6 +489,9 @@ async def _trim_result_problem(path: Path) -> str:
     return ""
 
 
+_PREVIEW_TIMEOUT = 300
+
+
 async def _make_preview_proxy(path: Path, vcodec: str) -> Optional[Path]:
     """Return an H.264 copy of *path* for in-app playback, transcoding once and
     caching it. Returns None when the source is already web-playable or the
@@ -504,9 +508,12 @@ async def _make_preview_proxy(path: Path, vcodec: str) -> Optional[Path]:
     # original file, which is what the trim endpoint actually cuts.
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-threads", "2", "-filter_threads", "1",
         "-i", str(path),
         "-map", "0:v:0?", "-map", "0:a?",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+        "-threads:v", "2",
+        "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2", "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "160k",
         "-movflags", "+faststart",
         # The temp name ends in .tmp, so name the container explicitly.
@@ -519,18 +526,24 @@ async def _make_preview_proxy(path: Path, vcodec: str) -> Optional[Path]:
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
-        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
-        if proc.returncode != 0 or not tmp.exists():
+        _, stderr = await communicate_with_timeout(proc, timeout=_PREVIEW_TIMEOUT)
+        if proc.returncode != 0 or not tmp.exists() or tmp.stat().st_size == 0:
             log.warning("preview proxy for %s failed: %s", path.name,
                         (stderr or b"").decode(errors="replace")[:200])
-            tmp.unlink(missing_ok=True)
             return None
-    except (asyncio.TimeoutError, OSError) as exc:
-        log.warning("preview proxy for %s errored: %s", path.name, exc)
-        tmp.unlink(missing_ok=True)
+        tmp.replace(proxy)
+        return proxy
+    except asyncio.TimeoutError:
+        log.warning("preview proxy for %s timed out after %ss", path.name, _PREVIEW_TIMEOUT)
         return None
-    tmp.replace(proxy)
-    return proxy
+    except OSError as exc:
+        log.warning("preview proxy for %s errored: %s", path.name, exc)
+        return None
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+_DISCORD_TIMEOUT = 600
 
 
 async def _make_discord_copy(path: Path, duration: float,
@@ -538,25 +551,24 @@ async def _make_discord_copy(path: Path, duration: float,
     """Return a copy of *path* small enough to drop into a Discord chat.
 
     The source itself when it already fits, a cached H.264 transcode when it
-    does not, and None when the transcode fails. Same bitrate budget as the
+    does not, and None when the transcode fails. Raises DiscordTooLarge when
+    no bitrate fits the clip under the cap. Same bitrate budget as the
     editor's "optimize for Discord" export, so the two produce comparable
     files.
     """
     try:
         already_small = (path.suffix.lower() == ".mp4"
-                         and path.stat().st_size <= DISCORD_MAX_MB * 1024 * 1024)
+                         and path.stat().st_size <= DISCORD_MAX_BYTES)
     except OSError:
         return None
     if already_small:
         return path
 
     out = _discord_path(path)
-    if out.exists() and out.stat().st_size > 0:
+    if out.exists() and 0 < out.stat().st_size <= DISCORD_MAX_BYTES:
         return out
 
-    audio_kbps = DISCORD_AUDIO_KBPS * max(audio_streams, 1)
-    budget_kbps = DISCORD_MAX_MB * 8192 * DISCORD_SIZE_MARGIN / max(duration, 1)
-    video_kbps = max(DISCORD_MIN_VIDEO_KBPS, round(budget_kbps - audio_kbps))
+    video_kbps, audio_kbps = discord_bitrates(duration, audio_streams)
 
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_suffix(".mp4.tmp")
@@ -566,13 +578,16 @@ async def _make_discord_copy(path: Path, duration: float,
         "-map", "0:v:0?", "-map", "0:a?",
         # 1440p at a Discord-sized bitrate looks worse than the same bits
         # spent on 1080p, and Discord's inline player tops out there anyway.
-        "-vf", "scale=-2:min(1080\\,ih)",
+        # The pad rounds both sides up: yuv420p has no odd dimension, and
+        # libx264 refuses the frame rather than fixing it (a 127x73 source
+        # scaled to 128x73 failed outright).
+        "-vf", "scale=-2:min(1080\\,ih),pad=ceil(iw/2)*2:ceil(ih/2)*2",
         "-c:v", "libx264", "-preset", "veryfast",
         "-b:v", f"{video_kbps}k",
         "-maxrate", f"{round(video_kbps * 1.45)}k",
         "-bufsize", f"{video_kbps * 2}k",
         "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", f"{DISCORD_AUDIO_KBPS}k",
+        "-c:a", "aac", "-b:a", f"{audio_kbps}k",
         "-movflags", "+faststart",
         "-f", "mp4",
         "-y", str(tmp),
@@ -583,20 +598,31 @@ async def _make_discord_copy(path: Path, duration: float,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
-        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=600)
-        if proc.returncode != 0 or not tmp.exists():
+        _, stderr = await communicate_with_timeout(proc, timeout=_DISCORD_TIMEOUT)
+        if proc.returncode != 0 or not tmp.exists() or tmp.stat().st_size == 0:
             log.warning("Discord copy of %s failed: %s", path.name,
                         (stderr or b"").decode(errors="replace")[:200])
-            tmp.unlink(missing_ok=True)
             return None
-    except (asyncio.TimeoutError, OSError) as exc:
-        log.warning("Discord copy of %s errored: %s", path.name, exc)
-        tmp.unlink(missing_ok=True)
+        # Single-pass ABR aims at the budget, it does not promise it. Never
+        # hand out or cache a copy Discord would reject.
+        size = tmp.stat().st_size
+        if size > DISCORD_MAX_BYTES:
+            log.warning("Discord copy of %s came out at %.1f MB, over the cap",
+                        path.name, size / 1048576)
+            return None
+        tmp.replace(out)
+        return out
+    except asyncio.TimeoutError:
+        log.warning("Discord copy of %s timed out after %ss", path.name,
+                    _DISCORD_TIMEOUT)
         return None
-    # ponytail: single-pass ABR, so a hard-to-encode clip can land a little
-    # over the cap. Add a size-corrected second pass if that shows up.
-    tmp.replace(out)
-    return out
+    except OSError as exc:
+        log.warning("Discord copy of %s errored: %s", path.name, exc)
+        return None
+    finally:
+        # communicate_with_timeout has already killed and reaped the encoder,
+        # so nothing is still writing to this file.
+        tmp.unlink(missing_ok=True)
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -635,7 +661,7 @@ async def _remux_moov(path: Path) -> bool:
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )
-        await asyncio.wait_for(proc.wait(), timeout=60)
+        await communicate_with_timeout(proc, timeout=60)
         if proc.returncode == 0 and tmp.exists():
             remuxed = await probe_media(tmp)
             orig_size = path.stat().st_size
@@ -656,10 +682,11 @@ async def _remux_moov(path: Path) -> bool:
             )
     except Exception as exc:
         log.warning("Remux of %s failed: %s", path.name, exc)
-    try:
-        tmp.unlink(missing_ok=True)
-    except Exception as exc:
-        log.debug("Could not remove the remux temp file %s: %s", tmp.name, exc)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError as exc:
+            log.debug("Could not remove the remux temp file %s: %s", tmp.name, exc)
     return False
 
 
@@ -710,12 +737,18 @@ async def _make_thumb(path: Path, duration: float = 0.0) -> Path:
     """
     THUMB_DIR.mkdir(parents=True, exist_ok=True)
     thumb = _thumb_path(path)
-    if thumb.exists():
+    if thumb.exists() and thumb.stat().st_size > 0:
         return thumb
     if duration and duration > 0:
         seek_ts = min(duration / 2.0, 0.75)
     else:
         seek_ts = 0.0
+    # Publish only complete images. Concurrent requests get separate temporary
+    # files, so cancellation cannot delete another request's finished thumbnail.
+    with tempfile.NamedTemporaryFile(
+        prefix=f".{thumb.stem}.", suffix=".jpg", dir=THUMB_DIR, delete=False,
+    ) as handle:
+        tmp = Path(handle.name)
     try:
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg", "-hide_banner", "-loglevel", "error",
@@ -724,13 +757,17 @@ async def _make_thumb(path: Path, duration: float = 0.0) -> Path:
             "-frames:v", "1",
             "-vf", "scale=640:-2",
             "-q:v", "4",
-            str(thumb),
+            "-y", str(tmp),
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )
-        await asyncio.wait_for(proc.wait(), timeout=20)
+        await communicate_with_timeout(proc, timeout=20)
+        if proc.returncode == 0 and tmp.stat().st_size > 0:
+            tmp.replace(thumb)
     except Exception as exc:
         log.debug("Thumbnail generation failed for %s: %s", path.name, exc)
+    finally:
+        tmp.unlink(missing_ok=True)
     return thumb
 
 
@@ -821,9 +858,12 @@ class ShareServer:
         self.editor_project = EditorProjectStore()
         self._exports = ExportManager(self.broadcast)
 
-        # One lock per derived file (preview proxy, Discord copy) so two
-        # opens of the same clip don't transcode it twice.
-        self._proxy_locks: dict[str, asyncio.Lock] = {}
+        # One encoder across the library, shared by preview proxies and
+        # Discord copies. Different clips used to spawn independent encoders,
+        # each allocating its own frame queues (#193).
+        self._proxy_lock = asyncio.Lock()
+        self._proxy_tasks: set[asyncio.Task] = set()
+        self._proxy_stopping = False
 
         self._tunnel_proc: Optional[asyncio.subprocess.Process] = None
         self._tunnel_url:  Optional[str] = None
@@ -986,6 +1026,12 @@ class ShareServer:
             await self._start_tunnel(public_port)
 
     async def stop(self) -> None:
+        self._proxy_stopping = True
+        tasks = list(self._proxy_tasks)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await self._exports.stop()
         for ws in list(self._ws_clients):
             try:
                 await ws.close()
@@ -1296,14 +1342,6 @@ class ShareServer:
             if served is not None:
                 return served
 
-        # The share modal asks for discord=1 for the file it drags out of the
-        # window. Built by /api/clips/{slug}/discord before the drag starts,
-        # so this is normally a cache hit.
-        if req.query.get("discord") == "1":
-            served = await self._serve_discord_copy(slug, path)
-            if served is not None:
-                return served
-
         # no-cache = revalidate before reuse. Slugs are not stable identities
         # (clip numbers get reused after deletes, trims rewrite in place), so
         # a cached response may belong to a different video than the slug
@@ -1322,11 +1360,18 @@ class ShareServer:
     async def _serve_preview_proxy(self, slug: str, path: Path):
         """Return a FileResponse for the clip's H.264 preview proxy, or None to
         fall back to serving the original."""
-        proxy_key = str(_proxy_path(path))
-        lock = self._proxy_locks.setdefault(proxy_key, asyncio.Lock())
-        async with lock:
-            meta = await self._get_meta(slug, path)
-            proxy = await _make_preview_proxy(path, meta.get("vcodec", ""))
+        if self._proxy_stopping:
+            raise web.HTTPServiceUnavailable()
+        task = asyncio.current_task()
+        self._proxy_tasks.add(task)
+        try:
+            proxy = _proxy_path(path)
+            if not proxy.exists() or proxy.stat().st_size == 0:
+                async with self._proxy_lock:
+                    meta = await self._get_meta(slug, path)
+                    proxy = await _make_preview_proxy(path, meta.get("vcodec", ""))
+        finally:
+            self._proxy_tasks.discard(task)
         if proxy is None or not proxy.exists():
             return None
         return web.FileResponse(
@@ -1339,29 +1384,29 @@ class ShareServer:
         )
 
     async def _prepare_discord_copy(self, slug: str, path: Path) -> Optional[Path]:
-        """The clip's Discord-sized file, transcoding it once if needed."""
-        lock = self._proxy_locks.setdefault(str(_discord_path(path)), asyncio.Lock())
-        async with lock:
-            meta = await self._get_meta(slug, path)
-            return await _make_discord_copy(
-                path,
-                meta.get("duration", 0),
-                meta.get("audio_streams", 1),
-            )
+        """The clip's Discord-sized file, transcoding it once if needed.
 
-    async def _serve_discord_copy(self, slug: str, path: Path):
-        """FileResponse for the Discord copy, or None to serve the original."""
-        copy_path = await self._prepare_discord_copy(slug, path)
-        if copy_path is None or not copy_path.exists():
-            return None
-        return web.FileResponse(
-            copy_path,
-            headers={
-                "Content-Type": "video/mp4",
-                "Accept-Ranges": "bytes",
-                "Cache-Control": "no-cache",
-            },
-        )
+        Raises DiscordTooLarge when the clip cannot fit the cap at all.
+        """
+        if self._proxy_stopping:
+            raise web.HTTPServiceUnavailable()
+        task = asyncio.current_task()
+        self._proxy_tasks.add(task)
+        try:
+            # A drag that is already encoded must not queue behind someone
+            # else's encode: the whole library shares one encoder lock.
+            cached = _discord_path(path)
+            if cached.exists() and 0 < cached.stat().st_size <= DISCORD_MAX_BYTES:
+                return cached
+            async with self._proxy_lock:
+                meta = await self._get_meta(slug, path)
+                return await _make_discord_copy(
+                    path,
+                    meta.get("duration", 0),
+                    meta.get("audio_streams", 1),
+                )
+        finally:
+            self._proxy_tasks.discard(task)
 
     async def _thumb(self, req: web.Request) -> web.Response:
         slug = req.match_info["slug"]
@@ -1370,7 +1415,7 @@ class ShareServer:
             raise web.HTTPNotFound()
         meta = await self._get_meta(slug, path)
         t = await _make_thumb(path, duration=meta.get("duration", 0))
-        if not t.exists():
+        if not t.exists() or t.stat().st_size == 0:
             raise web.HTTPNotFound()
         return web.FileResponse(t, headers={"Content-Type": "image/jpeg"})
 
@@ -1389,7 +1434,8 @@ class ShareServer:
 
         sem = asyncio.Semaphore(3)
         async def _ensure(slug: str, path: Path) -> None:
-            if _thumb_path(path).exists():
+            thumb = _thumb_path(path)
+            if thumb.exists() and thumb.stat().st_size > 0:
                 return
             async with sem:
                 await _make_thumb(path, duration=metas[slug].get("duration", 0))
@@ -1467,7 +1513,7 @@ class ShareServer:
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.PIPE,
                 )
-                _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+                _, stderr = await communicate_with_timeout(proc, timeout=timeout)
                 return proc.returncode == 0, (stderr or b"").decode()[:300]
             except asyncio.TimeoutError:
                 return False, "ffmpeg timed out"
@@ -1675,21 +1721,24 @@ class ShareServer:
         path = self._clips.get(slug)
         if not path or not path.exists():
             raise web.HTTPNotFound()
-        copy_path = await self._prepare_discord_copy(slug, path)
+        try:
+            copy_path = await self._prepare_discord_copy(slug, path)
+        except DiscordTooLarge as exc:
+            return web.json_response({"ok": False, "error": str(exc)})
         if copy_path is None or not copy_path.exists():
             return web.json_response(
                 {"ok": False, "error": "Could not build a Discord-sized copy"})
         st = copy_path.stat()
         return web.json_response({
             "ok": True,
-            "url": f"/v/{quote(slug, safe='')}?discord=1&r={st.st_mtime_ns}",
-            # The drag needs a real path: a drop target outside the window
-            # takes files as a file:// uri-list, not as an HTTP URL. Local
-            # route only, and the UI is the only caller.
+            # A path, not a URL: a drop target outside the window takes files
+            # as a file:// uri-list. There is deliberately no HTTP route for
+            # the copy, so nothing can fall back to the full-size original
+            # while claiming to serve a Discord-sized one.
             "path": str(copy_path),
             "filename": f"{slug}.mp4",
             "size": st.st_size,
-            "limit": DISCORD_MAX_MB * 1024 * 1024,
+            "limit": DISCORD_MAX_BYTES,
         })
 
     async def _api_images(self, _: web.Request) -> web.Response:
@@ -1836,7 +1885,7 @@ class ShareServer:
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
             )
-            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+            _, stderr = await communicate_with_timeout(proc, timeout=60)
         except asyncio.TimeoutError:
             out.unlink(missing_ok=True)
             return web.json_response({"ok": False, "error": "ffmpeg timed out reading that frame"})
@@ -2103,10 +2152,15 @@ class ShareServer:
             path.write_text(text)
 
         tmp = dest / f".{final.stem}.export.mp4"
-        cmd = build_export_cmd(project, sources, tmp,
-                               accent=str(body.get("accent", "")) or "#0099ff",
-                               text_dir=work,
-                               discord_optimized=bool(body.get("discord_optimized")))
+        discord_optimized = bool(body.get("discord_optimized"))
+        try:
+            cmd = build_export_cmd(project, sources, tmp,
+                                   accent=str(body.get("accent", "")) or "#0099ff",
+                                   text_dir=work,
+                                   discord_optimized=discord_optimized)
+        except DiscordTooLarge as exc:
+            shutil.rmtree(work, ignore_errors=True)
+            return web.json_response({"ok": False, "error": str(exc)}, status=400)
         add_to_library = bool(body.get("add_to_library"))
 
         async def on_done(path: Path) -> Optional[dict]:
@@ -2129,7 +2183,8 @@ class ShareServer:
 
         try:
             self._exports.start(job_id, cmd, project_extent(project), tmp, final,
-                                on_done=on_done, cleanup=cleanup)
+                                on_done=on_done, cleanup=cleanup,
+                                max_bytes=DISCORD_MAX_BYTES if discord_optimized else None)
         except ExportBusy:
             cleanup()
             return web.json_response(

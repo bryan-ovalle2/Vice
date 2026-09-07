@@ -481,9 +481,31 @@ class _VideoChain:
 # overhead and single-pass ABR variance so the file lands under it in one
 # encode rather than needing a slower two-pass run.
 DISCORD_MAX_MB = 20
+DISCORD_MAX_BYTES = DISCORD_MAX_MB * 1024 * 1024
 DISCORD_SIZE_MARGIN = 0.92
 DISCORD_AUDIO_KBPS = 128
 DISCORD_MIN_VIDEO_KBPS = 150
+
+
+class DiscordTooLarge(Exception):
+    """No bitrate fits this clip under the cap at a watchable quality."""
+
+
+def discord_bitrates(duration: float, audio_streams: int = 1) -> tuple[int, int]:
+    """(video kbps, per-track audio kbps) that fit DISCORD_MAX_MB.
+
+    Raises DiscordTooLarge when audio plus the video floor already overruns
+    the cap. Clamping to the floor and encoding anyway produced files far
+    over it: 1800s with one audio track budgets 62 MB at the floor.
+    """
+    audio_kbps = DISCORD_AUDIO_KBPS * max(audio_streams, 1)
+    budget_kbps = DISCORD_MAX_MB * 8192 * DISCORD_SIZE_MARGIN / max(duration, 1)
+    video_kbps = round(budget_kbps - audio_kbps)
+    if video_kbps < DISCORD_MIN_VIDEO_KBPS:
+        raise DiscordTooLarge(
+            f"{duration:.0f}s with {max(audio_streams, 1)} audio track(s) "
+            f"cannot fit {DISCORD_MAX_MB} MB. Trim it shorter first.")
+    return video_kbps, DISCORD_AUDIO_KBPS
 
 
 def build_export_cmd(project: dict, sources: dict[str, Source], out_path: Path,
@@ -578,9 +600,8 @@ def build_export_cmd(project: dict, sources: dict[str, Source], out_path: Path,
                      f"atrim=0:{_n(extent)},asetpts=PTS-STARTPTS[aout]")
 
     if discord_optimized:
-        audio_kbps = DISCORD_AUDIO_KBPS
-        budget_kbps = DISCORD_MAX_MB * 8192 * DISCORD_SIZE_MARGIN / max(extent, 1)
-        video_kbps = max(DISCORD_MIN_VIDEO_KBPS, round(budget_kbps - audio_kbps))
+        # One mixed track out, whatever the sources had.
+        video_kbps, audio_kbps = discord_bitrates(extent, 1)
         video_args = ["-c:v", "libx264", "-preset", "medium",
                      "-b:v", f"{video_kbps}k",
                      "-maxrate", f"{round(video_kbps * 1.45)}k",
@@ -708,6 +729,9 @@ class ExportManager:
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._task: Optional[asyncio.Task] = None
         self._canceled = False
+        self._started = False
+        self._committed = False
+        self._stopping = False
 
     @property
     def busy(self) -> bool:
@@ -716,24 +740,38 @@ class ExportManager:
     def start(self, job_id: str, cmd: list[str], total: float,
               tmp_path: Path, final_path: Path,
               on_done: Optional[Callable[[Path], Awaitable[Optional[dict]]]] = None,
-              cleanup: Optional[Callable[[], None]] = None) -> None:
-        if self.busy:
+              cleanup: Optional[Callable[[], None]] = None,
+              max_bytes: Optional[int] = None) -> None:
+        if self.busy or self._stopping:
             raise ExportBusy()
         self._job_id = job_id
         self._canceled = False
+        self._started = False
+        self._committed = False
         self._proc = None
         self._task = asyncio.create_task(
-            self._run(job_id, cmd, total, tmp_path, final_path, on_done, cleanup))
+            self._run(job_id, cmd, total, tmp_path, final_path, on_done, cleanup,
+                      max_bytes))
 
     async def _run(self, job_id: str, cmd: list[str], total: float,
-                   tmp: Path, final: Path, on_done, cleanup) -> None:
+                   tmp: Path, final: Path, on_done, cleanup,
+                   max_bytes: Optional[int] = None) -> None:
+        self._started = True
+        proc = None
+        spawn_task = None
+        err_task = None
         try:
+            if self._canceled:
+                return
             try:
-                proc = await asyncio.create_subprocess_exec(
+                # Cancellation must not lose ownership between spawning the
+                # process and receiving its handle. Cleanup awaits this task.
+                spawn_task = asyncio.create_task(asyncio.create_subprocess_exec(
                     *cmd,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
-                )
+                ))
+                proc = await asyncio.shield(spawn_task)
             except FileNotFoundError:
                 await self._broadcast({"type": "export_error", "job_id": job_id,
                                        "error": "ffmpeg not found", "canceled": False})
@@ -768,11 +806,6 @@ class ExportManager:
             await proc.wait()
             await err_task
 
-            if self._canceled:
-                tmp.unlink(missing_ok=True)
-                await self._broadcast({"type": "export_error", "job_id": job_id,
-                                       "error": "export canceled", "canceled": True})
-                return
             if proc.returncode != 0 or not tmp.exists():
                 tmp.unlink(missing_ok=True)
                 err = bytes(stderr_tail).decode(errors="replace").strip()[-300:]
@@ -783,7 +816,20 @@ class ExportManager:
                 })
                 return
 
+            # A bitrate target is a request, not a guarantee: check what the
+            # encoder actually produced before it becomes the export.
+            size = tmp.stat().st_size if max_bytes is not None else 0
+            if max_bytes is not None and size > max_bytes:
+                await self._broadcast({
+                    "type": "export_error", "job_id": job_id,
+                    "error": f"the export came out at {size / 1048576:.1f} MB, "
+                             f"over the {max_bytes // 1048576} MB limit",
+                    "canceled": False,
+                })
+                return
+
             tmp.replace(final)
+            self._committed = True
             clip = None
             if on_done:
                 try:
@@ -792,21 +838,63 @@ class ExportManager:
                     log.warning("Export post-processing failed: %s", exc)
             await self._broadcast({"type": "export_done", "job_id": job_id,
                                    "path": str(final), "clip": clip})
+        except asyncio.CancelledError:
+            self._canceled = True
+            raise
+        except Exception as exc:
+            log.warning("Export %s failed: %s", job_id, exc)
+            await self._broadcast({"type": "export_error", "job_id": job_id,
+                                   "error": str(exc), "canceled": False})
         finally:
+            if proc is None and spawn_task is not None:
+                try:
+                    proc = await spawn_task
+                    self._proc = proc
+                except OSError:
+                    pass  # Spawn failures are reported by the main path.
+            if proc is not None and proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+            if err_task is not None:
+                err_task.cancel()
+                await asyncio.gather(err_task, return_exceptions=True)
+            if proc is not None:
+                # The progress reader has stopped. Drain both pipes while
+                # reaping, including when cancellation interrupted a read.
+                await proc.communicate()
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError as exc:
+                log.debug("Could not remove export temporary file %s: %s", tmp, exc)
             if cleanup:
                 try:
                     cleanup()
                 except Exception as exc:
                     log.debug("Export cleanup failed: %s", exc)
+            if self._canceled:
+                await self._broadcast({"type": "export_error", "job_id": job_id,
+                                       "error": "export canceled", "canceled": True})
 
     async def cancel(self, job_id: str) -> bool:
-        if job_id != self._job_id or not self.busy:
+        if job_id != self._job_id or not self.busy or self._committed:
             return False
-        self._canceled = True
-        if self._proc and self._proc.returncode is None:
-            self._proc.terminate()
-            try:
-                await asyncio.wait_for(self._proc.wait(), timeout=3)
-            except asyncio.TimeoutError:
-                self._proc.kill()
+        if not self._canceled:
+            self._canceled = True
+            # Let a task that has not run enter its cleanup block. Once started,
+            # cancellation interrupts progress reads and reaps the owned child.
+            # Repeated requests must not interrupt cleanup with another cancel.
+            if self._started:
+                self._task.cancel()
+        await asyncio.shield(asyncio.gather(self._task, return_exceptions=True))
         return True
+
+    async def stop(self) -> None:
+        """Finish owned work before the server closes and reject new exports."""
+        self._stopping = True
+        if self.busy:
+            await self.cancel(self._job_id)
+            # A file already committed to its final name must finish its
+            # registration callback instead of being reported as canceled.
+            await asyncio.shield(asyncio.gather(self._task, return_exceptions=True))

@@ -74,7 +74,6 @@ export const api = {
     request<{
       ok?: boolean;
       error?: string;
-      url: string;
       path: string;
       filename: string;
       size: number;
